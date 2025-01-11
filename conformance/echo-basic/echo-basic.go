@@ -25,9 +25,12 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/signal"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"golang.org/x/net/http2"
@@ -46,6 +49,7 @@ type RequestAssertions struct {
 	Headers map[string][]string `json:"headers"`
 
 	Context `json:",inline"`
+	State   `json:",inline"`
 
 	TLS *TLSAssertions `json:"tls,omitempty"`
 }
@@ -78,6 +82,21 @@ type Context struct {
 
 var context Context
 
+type State struct {
+	Ready       bool `json:"ready"`
+	Stopping    bool `json:"stopping"`
+	Terminating bool `json:"terminating"`
+}
+
+type StateSync struct {
+	mu               sync.Mutex
+	stopDelay        time.Duration
+	terminationDelay time.Duration
+	State
+}
+
+var state StateSync
+
 func main() {
 	if os.Getenv("GRPC_ECHO_SERVER") != "" {
 		g.Main()
@@ -105,11 +124,32 @@ func main() {
 		Pod:       os.Getenv("POD_NAME"),
 	}
 
+	state = StateSync{State: State{
+		Ready:       true,
+		Terminating: false,
+		Stopping:    false,
+	}}
+	if stopDelay, err := time.ParseDuration(os.Getenv("DELAY_STOP")); err == nil && stopDelay > 0 {
+		state.stopDelay = stopDelay
+	}
+	if terminationDelay, err := time.ParseDuration(os.Getenv("DELAY_TERMINATION")); err == nil && terminationDelay > 0 {
+		state.terminationDelay = terminationDelay
+	}
+	if readyDelay, err := time.ParseDuration(os.Getenv("DELAY_READY")); err == nil && readyDelay > 0 {
+		setStateReady(false)
+		time.AfterFunc(readyDelay, func() {
+			setStateReady(true)
+		})
+	}
+
 	httpMux := http.NewServeMux()
 	httpMux.HandleFunc("/health", healthHandler)
+	httpMux.HandleFunc("/ready", readyHandler)
 	httpMux.HandleFunc("/status/", statusHandler)
 	httpMux.HandleFunc("/", echoHandler)
 	httpMux.Handle("/ws", websocket.Handler(wsHandler))
+	httpMux.HandleFunc("/stop", stopHandler)
+	httpMux.HandleFunc("/stateControl", stateControlHandler)
 	httpHandler := &preserveSlashes{httpMux}
 
 	errchan := make(chan error)
@@ -122,7 +162,7 @@ func main() {
 		}
 	}()
 
-	go runH2CServer(h2cPort, errchan)
+	go runH2CServer(h2cPort, httpHandler, errchan)
 
 	// Enable HTTPS if certificate and private key are given.
 	if os.Getenv("TLS_SERVER_CERT") != "" && os.Getenv("TLS_SERVER_PRIVKEY") != "" {
@@ -135,9 +175,29 @@ func main() {
 		}()
 	}
 
-	if err := <-errchan; err != nil {
-		panic(fmt.Sprintf("Failed to start listening: %s\n", err.Error()))
+	sigChan := make(chan os.Signal)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	select {
+	case err := <-errchan:
+		if err != nil {
+			panic(fmt.Sprintf("Failed to start listening: %s\n", err.Error()))
+		}
+	case sig := <-sigChan:
+		fmt.Printf("received signal %v, shutting down\n", sig)
+		state.mu.Lock()
+		state.Terminating = true
+		sleep := state.terminationDelay
+		state.mu.Unlock()
+		time.Sleep(sleep)
+		fmt.Printf("shutdown complete\n")
 	}
+}
+
+func setStateReady(ready bool) {
+	state.mu.Lock()
+	fmt.Printf("setting state.Ready = %t\n", ready)
+	state.Ready = ready
+	state.mu.Unlock()
 }
 
 func wsHandler(ws *websocket.Conn) {
@@ -150,6 +210,67 @@ func wsHandler(ws *websocket.Conn) {
 func healthHandler(w http.ResponseWriter, r *http.Request) { //nolint:revive
 	w.WriteHeader(200)
 	_, _ = w.Write([]byte(`OK`))
+}
+
+func readyHandler(w http.ResponseWriter, r *http.Request) {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	if state.State.Ready {
+		w.WriteHeader(200)
+	} else {
+		w.WriteHeader(503)
+	}
+}
+
+func stateControlHandler(w http.ResponseWriter, r *http.Request) {
+	terminationDelayUpdate := r.FormValue("terminationDelay")
+	stopDelayUpdate := r.FormValue("stopDelay")
+	readyUpdate := r.FormValue("ready")
+
+	if terminationDelay, err := time.ParseDuration(terminationDelayUpdate); err == nil {
+		fmt.Printf("setting termination delay to %s\n", terminationDelay)
+		state.mu.Lock()
+		state.terminationDelay = terminationDelay
+		state.mu.Unlock()
+	}
+	if stopDelay, err := time.ParseDuration(stopDelayUpdate); err == nil {
+		fmt.Printf("setting stop delay to %s\n", stopDelay)
+		state.mu.Lock()
+		state.stopDelay = stopDelay
+		state.mu.Unlock()
+	}
+	if len(readyUpdate) > 0 {
+		ready := "false" != strings.ToLower(readyUpdate)
+		setStateReady(ready)
+	}
+
+	w.WriteHeader(200)
+	_, _ = w.Write([]byte(`OK`))
+}
+
+func stopHandler(w http.ResponseWriter, r *http.Request) {
+	notReadyAfter := r.FormValue("setNotReadyAfter")
+	state.mu.Lock()
+	if !state.Stopping {
+		fmt.Print("setting state.Stopping = true\n")
+		state.Stopping = true
+	}
+	stopSleep := state.stopDelay
+	state.mu.Unlock()
+
+	w.WriteHeader(200)
+	_, _ = w.Write([]byte(`stopping...`))
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+	if notReadySleep, err := time.ParseDuration(notReadyAfter); err == nil && notReadySleep > 0 {
+		time.AfterFunc(notReadySleep, func() {
+			setStateReady(false)
+		})
+	}
+	time.Sleep(stopSleep)
+	_, _ = w.Write([]byte(`done`))
 }
 
 func statusHandler(w http.ResponseWriter, r *http.Request) {
@@ -178,15 +299,15 @@ func delayResponse(request *http.Request) error {
 	return nil
 }
 
-func runH2CServer(h2cPort string, errchan chan<- error) {
+func runH2CServer(h2cPort string, h1Handler http.Handler, errchan chan<- error) {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.ProtoMajor != 2 && r.Header.Get("Upgrade") != "h2c" {
 			w.WriteHeader(http.StatusBadRequest)
-			fmt.Fprint(w, "Expected h2c request")
+			_, _ = fmt.Fprint(w, "Expected h2c request")
 			return
 		}
 
-		echoHandler(w, r)
+		h1Handler.ServeHTTP(w, r)
 	})
 	h2c := &http.Server{
 		ReadHeaderTimeout: time.Second,
@@ -210,6 +331,10 @@ func echoHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	state.mu.Lock()
+	stateCp := state.State
+	state.mu.Unlock()
+
 	requestAssertions := RequestAssertions{
 		r.RequestURI,
 		r.Host,
@@ -218,6 +343,7 @@ func echoHandler(w http.ResponseWriter, r *http.Request) {
 		r.Header,
 
 		context,
+		stateCp,
 
 		tlsStateToAssertions(r.TLS),
 	}
